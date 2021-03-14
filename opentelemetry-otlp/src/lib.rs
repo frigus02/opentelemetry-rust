@@ -49,14 +49,24 @@
 //! ## Performance
 //!
 //! For optimal performance, a batch exporter is recommended as the simple
-//! exporter will export each span synchronously on dropping. Enable a runtime
-//! to have a batch exporter configured automatically for either executor
-//! when using the pipeline.
+//! exporter will export each span synchronously on dropping. You can enable the
+//! [`rt-tokio`], [`rt-tokio-current-thread`] or [`rt-async-std`] features and
+//! specify a runtime on the pipeline builder to have a batch exporter
+//! configured for you automatically.
 //!
 //! ```toml
 //! [dependencies]
 //! opentelemetry = { version = "*", features = ["async-std"] }
 //! opentelemetry-otlp = { version = "*", features = ["grpc-sys"] }
+//! ```
+//!
+//! ```no_run
+//! # fn main() -> Result<(), opentelemetry::trace::TraceError> {
+//! let tracer = opentelemetry_otlp::new_pipeline()
+//!     .with_runtime(opentelemetry::runtime::AsyncStd)
+//!     .install()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! [`tokio`]: https://tokio.rs
@@ -89,6 +99,7 @@
 //!     map.insert_bin("trace-proto-bin", MetadataValue::from_bytes(b"[binary data]"));
 //!
 //!     let tracer = opentelemetry_otlp::new_pipeline()
+//!         .with_runtime(opentelemetry::runtime::Tokio)
 //!         .with_endpoint("localhost:4317")
 //!         .with_protocol(Protocol::Grpc)
 //!         .with_timeout(Duration::from_secs(3))
@@ -125,7 +136,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg), deny(broken_intra_doc_links))]
 #![cfg_attr(test, deny(warnings))]
 
-use opentelemetry::{global, sdk, trace::TracerProvider};
+use opentelemetry::{global, runtime::Runtime, sdk, trace::TracerProvider};
 
 #[cfg(feature = "grpc-sys")]
 use std::collections::HashMap;
@@ -201,7 +212,7 @@ const OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TRACES_TIMEO
 ///     Ok(())
 /// }
 /// ```
-pub fn new_pipeline() -> OtlpPipelineBuilder {
+pub fn new_pipeline() -> OtlpPipelineBuilder<()> {
     OtlpPipelineBuilder::default()
 }
 
@@ -217,12 +228,13 @@ pub fn new_pipeline() -> OtlpPipelineBuilder {
 /// }
 /// ```
 #[derive(Default, Debug)]
-pub struct OtlpPipelineBuilder {
+pub struct OtlpPipelineBuilder<R: Runtime> {
     exporter_config: ExporterConfig,
     trace_config: Option<sdk::trace::Config>,
+    runtime: R,
 }
 
-impl OtlpPipelineBuilder {
+impl<R: Runtime> OtlpPipelineBuilder<R> {
     /// Set the address of the OTLP collector. If not set, the default address is used.
     pub fn with_endpoint<T: Into<String>>(mut self, endpoint: T) -> Self {
         self.exporter_config.endpoint = endpoint.into();
@@ -245,6 +257,15 @@ impl OtlpPipelineBuilder {
     pub fn with_trace_config(mut self, trace_config: sdk::trace::Config) -> Self {
         self.trace_config = Some(trace_config);
         self
+    }
+
+    /// Assign the runtime to use.
+    pub fn with_runtime<NewR: Runtime>(self, runtime: NewR) -> OtlpPipelineBuilder<NewR> {
+        OtlpPipelineBuilder {
+            exporter_config: self.exporter_config,
+            trace_config: self.trace_config,
+            runtime,
+        }
     }
 
     /// Set the trace provider configuration from the given environment variables.
@@ -270,21 +291,23 @@ impl OtlpPipelineBuilder {
 
     /// Use tonic as grpc layer, return a `TonicPipelineBuilder` to config tonic and build the exporter.
     #[cfg(feature = "tonic")]
-    pub fn with_tonic(self) -> TonicPipelineBuilder {
+    pub fn with_tonic(self) -> TonicPipelineBuilder<R> {
         TonicPipelineBuilder {
             exporter_config: self.exporter_config,
             trace_config: self.trace_config,
             tonic_config: TonicConfig::default(),
+            runtime: self.runtime,
         }
     }
 
     /// Use grpcio as grpc layer, return a `GrpcioPipelineBuilder` to config the grpcio and build the exporter.
     #[cfg(feature = "grpc-sys")]
-    pub fn with_grpcio(self) -> GrpcioPipelineBuilder {
+        pub fn with_grpcio(self) -> GrpcioPipelineBuilder<R> {
         GrpcioPipelineBuilder {
             exporter_config: self.exporter_config,
             trace_config: self.trace_config,
             grpcio_config: GrpcioConfig::default(),
+            runtime: self.runtime,
         }
     }
 }
@@ -294,14 +317,15 @@ impl OtlpPipelineBuilder {
 /// User can get the `TonicPipelineBuilder` by calling `with_tonic` function in `OtlpPipelineBuilder`
 #[derive(Default, Debug)]
 #[cfg(feature = "tonic")]
-pub struct TonicPipelineBuilder {
+pub struct TonicPipelineBuilder<R: Runtime> {
     exporter_config: ExporterConfig,
     tonic_config: TonicConfig,
     trace_config: Option<sdk::trace::Config>,
+    runtime: R,
 }
 
 #[cfg(feature = "tonic")]
-impl TonicPipelineBuilder {
+impl<R: Runtime> TonicPipelineBuilder<R> {
     /// Set the TLS settings for the collector endpoint.
     #[cfg(feature = "tls")]
     pub fn with_tls_config(mut self, tls_config: ClientTlsConfig) -> Self {
@@ -318,7 +342,11 @@ impl TonicPipelineBuilder {
     /// Install a trace exporter using tonic
     pub fn install(self) -> Result<sdk::trace::Tracer, TraceError> {
         let exporter = TraceExporter::new_tonic(self.exporter_config, self.tonic_config)?;
-        Ok(build_with_exporter(exporter, self.trace_config))
+        Ok(build_with_exporter(
+            exporter,
+            self.trace_config,
+            self.runtime,
+        ))
     }
 }
 
@@ -327,14 +355,15 @@ impl TonicPipelineBuilder {
 /// User can get the `GrpcioPipelineBuilder` by calling `with_grpcio` function in `OtlpPipelineBuilder`
 #[derive(Default, Debug)]
 #[cfg(feature = "grpc-sys")]
-pub struct GrpcioPipelineBuilder {
+pub struct GrpcioPipelineBuilder<R: Runtime> {
     exporter_config: ExporterConfig,
     grpcio_config: GrpcioConfig,
     trace_config: Option<sdk::trace::Config>,
+    runtime: R,
 }
 
 #[cfg(feature = "grpc-sys")]
-impl GrpcioPipelineBuilder {
+impl<R: Runtime> GrpcioPipelineBuilder<R> {
     /// Set the credentials to use when communicating with the collector.
     pub fn with_credentials(mut self, credentials: Credentials) -> Self {
         self.grpcio_config.credentials = Some(credentials);
@@ -368,15 +397,21 @@ impl GrpcioPipelineBuilder {
     /// Install a trace exporter using grpcio
     pub fn install(self) -> Result<sdk::trace::Tracer, TraceError> {
         let exporter = TraceExporter::new_grpcio(self.exporter_config, self.grpcio_config);
-        Ok(build_with_exporter(exporter, self.trace_config))
+        Ok(build_with_exporter(
+            exporter,
+            self.trace_config,
+            self.runtime,
+        ))
     }
 }
 
-fn build_with_exporter(
+fn build_with_exporter<R: Runtime>(
     exporter: TraceExporter,
     trace_config: Option<sdk::trace::Config>,
+    runtime: R,
 ) -> sdk::trace::Tracer {
-    let mut provider_builder = sdk::trace::TracerProvider::builder().with_exporter(exporter);
+    let mut provider_builder =
+        sdk::trace::TracerProvider::builder().with_exporter(exporter, runtime);
     if let Some(config) = trace_config {
         provider_builder = provider_builder.with_config(config);
     }
